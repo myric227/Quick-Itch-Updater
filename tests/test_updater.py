@@ -4,7 +4,8 @@ from pathlib import Path
 import stat
 from tempfile import TemporaryDirectory
 import unittest
-from zipfile import ZipFile, ZipInfo
+from unittest.mock import patch
+from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
 
 import httpx
 
@@ -12,12 +13,12 @@ from quick_itch.files import KEEP_ARCHIVES, FileSafetyError, download_version, e
 from quick_itch.itch import ItchClient, ItchError
 from quick_itch.model import Asset, Upload, pending_changes
 from quick_itch.store import DownloadRecord, Store
-from quick_itch.updater import Updater
+from quick_itch.updater import CheckResult, Updater
 
 
-def archive_bytes(name="asset.txt", contents=b"asset"):
+def archive_bytes(name="asset.txt", contents=b"asset", compression=ZIP_STORED):
     stream = io.BytesIO()
-    with ZipFile(stream, "w") as archive:
+    with ZipFile(stream, "w", compression=compression) as archive:
         archive.writestr(name, contents)
     return stream.getvalue()
 
@@ -78,9 +79,9 @@ class UpdateTests(unittest.TestCase):
             store.import_library(1, assets)
             reopened = Store(database)
             updater = Updater(reopened, Credentials(), lambda key: ItchClient(key, httpx.MockTransport(handler)))
-            results, errors = updater.check(1)
-            self.assertFalse(errors)
-            self.assertEqual(set(results), {5, 8, 12})
+            result = updater.check(1)
+            self.assertFalse(result.errors)
+            self.assertEqual(set(result.pending), {5, 8, 12})
             self.assertCountEqual(requests, [f"/games/{i}/uploads" for i in (5, 8, 12)])
             self.assertTrue(all(row.last_checked for row in reopened.library(1, tracked_only=True)))
             reopened.track(1, 5, False)
@@ -132,11 +133,10 @@ class UpdateTests(unittest.TestCase):
             client_factory = lambda key: ItchClient(key, httpx.MockTransport(handler))
             updater = Updater(store, credentials, client_factory)
             self.assertEqual(updater.connect("test-key"), (10, 1))
-            self.assertEqual(updater.check(10), ({}, []))
+            self.assertEqual(updater.check(10), CheckResult())
             store.set_setting("download_root", str(Path(temp) / "GameAssets"))
             store.track(10, 1, True)
-            result, _ = updater.check(10)
-            upload = next(iter(result[1]))
+            upload = next(iter(updater.check(10).pending[1]))
             downloaded = updater.download_many(10, [(1, upload)], lambda *_: None)
             self.assertEqual(downloaded.saved, 1)
             self.assertEqual(downloaded.pending, {1: {}})
@@ -151,11 +151,11 @@ class UpdateTests(unittest.TestCase):
             with store.connect() as connection:
                 connection.execute("UPDATE versions SET path = ?, current = 0", (str(legacy_path),))
             restarted = Updater(Store(database), credentials, client_factory)
-            self.assertEqual(restarted.check(10), ({1: {}}, []))
+            self.assertEqual(restarted.check(10), CheckResult(pending={1: {}}))
             self.assertEqual(file_requests, ["/asset.zip"])
             self.assertEqual(store.library(10)[0].status, "Up to date")
             (legacy_path / "asset.txt").unlink()
-            self.assertEqual(restarted.check(10), ({1: {upload: "Files missing locally"}}, []))
+            self.assertEqual(restarted.check(10), CheckResult(pending={1: {upload: "Files missing locally"}}))
             store.set_pack_settings(10, 1, None, KEEP_ARCHIVES)
             restored = restarted.download_many(10, [(1, upload)], lambda *_: None)
             self.assertEqual(restored.saved, 1)
@@ -187,7 +187,7 @@ class UpdateTests(unittest.TestCase):
 
             reopened = Store(db)
             updater = Updater(reopened, object())
-            changes = updater._check_asset(Client(), 10, asset)
+            changes = updater._check_asset(Client(), 10, asset, [])
             self.assertEqual(set(changes), {archive, new_file})
             self.assertEqual(reopened.hidden_uploads(10, asset.id), {coupon.id})
             self.assertEqual(set(updater.change_upload_visibility(10, asset.id, {coupon.id: True})),
@@ -209,7 +209,7 @@ class UpdateTests(unittest.TestCase):
             if path.startswith("/uploads/"):
                 upload = int(path.split("/")[2])
                 transfers.append(upload)
-                if upload == 12:
+                if upload == 12 and transfers.count(upload) == 1:
                     return httpx.Response(403)
                 return httpx.Response(302, headers={"Location": f"https://cdn.example/{upload}.zip"})
             return httpx.Response(200, stream=httpx.ByteStream(package))
@@ -225,7 +225,7 @@ class UpdateTests(unittest.TestCase):
                 store.track(10, asset, True)
             store.set_setting("download_root", str(Path(temp) / "GameAssets"))
             updater = Updater(store, Credentials(), lambda key: ItchClient(key, httpx.MockTransport(handler)))
-            pending, _ = updater.check(10)
+            pending = updater.check(10).pending
             selections = [(asset, upload) for asset, changes in pending.items() for upload in changes]
             store.set_upload_visibility(10, 1, {13: False})
             polled.clear()
@@ -236,6 +236,56 @@ class UpdateTests(unittest.TestCase):
             self.assertEqual(len(batch.errors), 2)
             self.assertEqual([upload.id for upload in batch.pending[1]], [12])
             self.assertFalse(batch.pending[2])
+            self.assertEqual([(asset, upload.id) for asset, upload in batch.retryable], [(1, 12)])
+            retry = updater.download_many(10, batch.retryable, lambda *_: None)
+            self.assertEqual(retry.saved, 1)
+            self.assertFalse(retry.errors)
+            self.assertEqual(transfers, [11, 12, 21, 12])
+
+    def test_upload_listing_tries_other_keys_after_access_denials(self):
+        def handler(request):
+            key = request.url.params["download_key_id"]
+            checked.append(key)
+            if key == "14":
+                return httpx.Response(403)
+            if key == "15":
+                return httpx.Response(200, json={"errors": ["Invalid download key"]})
+            return httpx.Response(200, json={"uploads": [
+                {"id": 21, "filename": "asset.zip", "storage": "hosted"},
+            ]})
+
+        checked = []
+        with ItchClient("test-key", httpx.MockTransport(handler)) as client:
+            uploads = client.uploads(Asset(1, "Pack", "Creator", "", (14, 15, 16)))
+            self.assertEqual([(upload.id, upload.key_id) for upload in uploads], [(21, 16)])
+            self.assertEqual(checked, ["14", "15", "16"])
+            with self.assertRaises(ItchError):
+                client.uploads(Asset(1, "Pack", "Creator", "", (14, 15)))
+
+    def test_pack_rename_keeps_existing_folder_including_migrated_downloads(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = Store(root / "library.db")
+            store.set_setting("download_root", str(root / "GameAssets"))
+            updater = Updater(store, object())
+            store.import_library(1, [Asset(1, "Old title", "Old creator", "", (1,))])
+            destination = updater.folder(store.library(1)[0])
+            first, second = archive_bytes(), archive_bytes(contents=b"new version")
+            initial, update = hosted_upload(first), hosted_upload(second, "later")
+            saved = download_version(Transfer(first), initial, destination, [], lambda *_: None,
+                                     record=DownloadRecord(store, 1, 1, initial))
+            store.import_library(1, [Asset(1, "New title", "New creator", "", (1,))])
+            self.assertEqual(updater.folder(store.library(1)[0]), destination)
+            with store.connect() as connection:
+                connection.execute("UPDATE assets SET default_folder = NULL")
+            reopened = Store(store.database)
+            updater = Updater(reopened, object())
+            self.assertEqual(updater.folder(reopened.library(1)[0]), destination)
+            newer = download_version(Transfer(second), update, updater.folder(reopened.library(1)[0]),
+                                     reopened.versions(1, 1), lambda *_: None,
+                                     record=DownloadRecord(reopened, 1, 1, update))
+            self.assertEqual(newer.path, saved.path)
+            self.assertEqual((newer.path / "asset.txt").read_bytes(), b"new version")
 
 
 class DownloadTests(unittest.TestCase):
@@ -336,7 +386,7 @@ class DownloadTests(unittest.TestCase):
                                      record=DownloadRecord(store, 1, 1, initial))
             backup = destination / ".quick-itch-backup-test"
             record = DownloadRecord(store, 1, 1, hosted_upload(first, "newer"))
-            record.begin(saved.path, backup)
+            record.begin(saved.path, backup, saved)
             saved.path.rename(backup)
             saved.path.mkdir()
             (saved.path / "asset.txt").write_bytes(b"version 2")
@@ -344,6 +394,74 @@ class DownloadTests(unittest.TestCase):
             self.assertEqual((saved.path / "asset.txt").read_bytes(), b"version 1")
             self.assertFalse(backup.exists())
             self.assertEqual(store.versions(1, 1)[0].revision, initial.revision)
+
+    def test_replacement_keeps_edits_saved_during_the_swap(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            first, second = archive_bytes(), archive_bytes(contents=b"new version")
+            saved = download_version(Transfer(first), hosted_upload(first), root, [], lambda *_: None)
+            original_rename = Path.rename
+
+            def save_local_edit(path, target):
+                if path == saved.path and target.name.startswith(".quick-itch-backup-"):
+                    (path / "notes.txt").write_text("Local edits")
+                return original_rename(path, target)
+
+            with patch.object(Path, "rename", save_local_edit):
+                result = download_version(Transfer(second), hosted_upload(second, "later"), root, [saved], lambda *_: None)
+            self.assertEqual((result.path / "asset.txt").read_bytes(), b"new version")
+            self.assertEqual((result.retained_backup / "notes.txt").read_text(), "Local edits")
+
+    def test_committed_leftover_backup_does_not_block_checks_or_new_updates(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = Store(root / "library.db")
+            asset = Asset(1, "Pack", "Creator", "", (1,))
+            store.import_library(1, [asset])
+            store.track(1, 1, True)
+            destination = root / "downloads"
+            first, second, third = (archive_bytes(contents=content) for content in (b"first", b"second", b"third"))
+            initial, update, next_update = hosted_upload(first), hosted_upload(second, "later"), hosted_upload(third, "latest")
+            download_version(Transfer(first), initial, destination, [], lambda *_: None,
+                             record=DownloadRecord(store, 1, 1, initial))
+            with patch("quick_itch.files.finish_backup", side_effect=PermissionError):
+                saved = download_version(Transfer(second), update, destination, store.versions(1, 1),
+                                         lambda *_: None, record=DownloadRecord(store, 1, 1, update))
+            self.assertTrue(saved.cleanup_pending)
+            notes = saved.path / "notes.txt"
+            notes.write_text("Local edits")
+
+            class Client:
+                def uploads(self, _):
+                    return [next_update]
+
+            retained = []
+            changes = Updater(store, object())._check_asset(Client(), 1, asset, retained)
+            self.assertIn(next_update, changes)
+            self.assertEqual(len(retained), 1)
+            self.assertEqual((retained[0] / "asset.txt").read_bytes(), b"first")
+            self.assertEqual(store.recover_downloads(1, 1), [])
+            newer = download_version(Transfer(third), next_update, destination, store.versions(1, 1),
+                                     lambda *_: None, record=DownloadRecord(store, 1, 1, next_update))
+            self.assertEqual((newer.path / "asset.txt").read_bytes(), b"third")
+            self.assertEqual(notes.read_text(), "Local edits")
+
+    def test_corrupt_deflate_is_reported_as_a_file_failure(self):
+        package = bytearray(archive_bytes(compression=ZIP_DEFLATED))
+        package[30 + len("asset.txt")] = 0xff
+        with TemporaryDirectory() as temp:
+            destination = Path(temp) / "downloads"
+            with self.assertRaisesRegex(FileSafetyError, "damaged"):
+                download_version(Transfer(package), hosted_upload(package), destination, [], lambda *_: None)
+            self.assertEqual(list(destination.iterdir()), [])
+
+    def test_long_zip_filename_still_extracts(self):
+        package = archive_bytes()
+        upload = Upload(10, "Long filename " * 8 + ".ZIP", len(package), "hosted", 99)
+        with TemporaryDirectory() as temp:
+            saved = download_version(Transfer(package), upload, Path(temp), [], lambda *_: None)
+            self.assertEqual((saved.path / "asset.txt").read_bytes(), b"asset")
+            self.assertTrue(saved.manifest.filename.endswith(".ZIP"))
 
     def test_unsupported_zip_keeps_only_the_original(self):
         data = bytearray(archive_bytes())

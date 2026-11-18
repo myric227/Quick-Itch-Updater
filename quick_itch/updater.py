@@ -5,9 +5,9 @@ import sqlite3
 
 from keyring.backends.Windows import WinVaultKeyring
 
-from .files import EXTRACT_ZIPS, FileSafetyError, download_version, file_component, validate_destination, version_available
+from .files import EXTRACT_ZIPS, FileSafetyError, download_version, validate_destination, version_available
 from .itch import ItchClient, ItchError
-from .model import pending_changes
+from .model import Upload, pending_changes
 from .store import DownloadRecord, utc_now
 
 
@@ -21,8 +21,17 @@ class DownloadResult:
     duplicates: int = 0
     preserved: int = 0
     cleanup_pending: int = 0
+    retained_backups: list[Path] = field(default_factory=list)
     errors: list[tuple[str, str]] = field(default_factory=list)
+    retryable: list[tuple[int, Upload]] = field(default_factory=list)
     pending: dict = field(default_factory=dict)
+
+
+@dataclass
+class CheckResult:
+    pending: dict = field(default_factory=dict)
+    errors: list[tuple[str, str]] = field(default_factory=list)
+    retained_backups: list[Path] = field(default_factory=list)
 
 
 class Updater:
@@ -59,11 +68,11 @@ class Updater:
         if row.destination:
             return Path(row.destination)
         base = Path(self.store.setting("download_root") or (Path.home() / "GameAssets"))
-        return base / file_component(row.asset.creator) / f"{file_component(row.asset.title)} [{row.asset.id}]"
+        return base / row.default_folder
 
-    def _check_asset(self, client, account, asset):
+    def _check_asset(self, client, account, asset, retained_backups):
         try:
-            self.store.recover_downloads(account, asset.id)
+            retained_backups.extend(self.store.recover_downloads(account, asset.id))
         except OSError:
             raise FileSafetyError("Windows could not recover a previous download. Close files from this pack and retry.") from None
         uploads = client.uploads(asset)
@@ -117,19 +126,19 @@ class Updater:
         return changes
 
     def check(self, account):
-        results, errors = {}, []
+        result = CheckResult()
         rows = self.store.library(account, tracked_only=True)
         if not rows:
-            return results, errors
+            return result
         with self.client(account) as client:
             for row in rows:
                 try:
-                    results[row.asset.id] = self._check_asset(client, account, row.asset)
+                    result.pending[row.asset.id] = self._check_asset(client, account, row.asset, result.retained_backups)
                 except (ItchError, FileSafetyError) as error:
                     self.store.set_status(account, row.asset.id, "Check failed")
-                    errors.append((row.asset.title, str(error)))
+                    result.errors.append((row.asset.title, str(error)))
                     LOGGER.warning("Update check failed for asset %d", row.asset.id)
-        return results, errors
+        return result
 
     def download_many(self, account, selections, progress):
         result = DownloadResult()
@@ -150,14 +159,16 @@ class Updater:
                     continue
                 try:
                     destination = validate_destination(self.folder(row))
-                    changes = self._check_asset(client, account, row.asset)
+                    changes = self._check_asset(client, account, row.asset, result.retained_backups)
                 except (ItchError, FileSafetyError) as error:
                     result.errors.extend((upload.label, str(error)) for upload in selected.values())
+                    result.retryable.extend((asset, upload) for upload in selected.values())
                     file_number += len(selected)
                     continue
                 except OSError:
                     result.errors.extend((upload.label, "Windows could not verify the download folder.")
                                          for upload in selected.values())
+                    result.retryable.extend((asset, upload) for upload in selected.values())
                     file_number += len(selected)
                     continue
                 current = {upload.revision: upload for upload in changes}
@@ -179,15 +190,20 @@ class Updater:
                             mode, record=DownloadRecord(self.store, account, asset, upload),
                         )
                     except (ItchError, FileSafetyError) as error:
-                        result.errors.append((upload.label, str(error)))
+                        message = str(error)
                     except OSError:
-                        result.errors.append((upload.label, "Windows could not save or extract this file."))
+                        message = "Windows could not save or extract this file."
                     except sqlite3.Error:
-                        result.errors.append((upload.label, "Could not record the download. Check for updates and retry."))
+                        message = "Could not record the download. Check for updates and retry."
                     else:
                         result.saved += int(download.created)
                         result.duplicates += int(not download.created)
                         result.preserved += int(download.preserved)
                         result.cleanup_pending += int(download.cleanup_pending)
+                        if download.retained_backup is not None:
+                            result.retained_backups.append(download.retained_backup)
+                        continue
+                    result.errors.append((upload.label, message))
+                    result.retryable.append((asset, upload))
                 result.pending[asset] = self._pending(account, asset, self.store.uploads(account, asset))
         return result

@@ -4,7 +4,6 @@ import logging
 import os
 from pathlib import Path
 from queue import Empty, SimpleQueue
-import sqlite3
 
 from keyring.errors import KeyringError
 from PySide6.QtCore import QTimer, Qt, QUrl
@@ -15,12 +14,15 @@ from PySide6.QtWidgets import (
     QProgressBar, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from . import __version__
 from .appearance import CheckCellDelegate, STATUS_COLORS, THEMES, apply_theme
 from .files import EXTRACT_ZIPS, KEEP_ARCHIVES, FileSafetyError, validate_destination
 from .itch import ItchError
 
 
 LOGGER = logging.getLogger(__name__)
+LIBRARY_SORTS = ("pack", "creator", "tracking", "status", "last_checked", "latest_update")
+ATTENTION_STATUSES = {"Ready to download", "Update available", "Possible change", "Files missing locally", "Check failed"}
 
 
 def date_label(value):
@@ -32,11 +34,49 @@ def date_label(value):
     return "—"
 
 
+def sort_date(value):
+    if value:
+        try:
+            return datetime.fromisoformat(value).timestamp()
+        except (ValueError, OverflowError, OSError):
+            pass
+    return None
+
+
+def library_status(row):
+    if not row.available:
+        return "Unavailable on itch.io"
+    return (row.status or "Not checked") if row.tracked else "Not tracked"
+
+
+def sorted_library(rows, column, descending):
+    key = (
+        lambda row: row.asset.title.casefold(),
+        lambda row: row.asset.creator.casefold(),
+        lambda row: row.tracked,
+        lambda row: library_status(row).casefold(),
+        lambda row: sort_date(row.last_checked),
+        lambda row: sort_date(row.last_update),
+    )[column]
+    values, missing = [], []
+    for row in sorted(rows, key=lambda item: (item.asset.title.casefold(), item.asset.id)):
+        value = key(row)
+        if value is None:
+            missing.append(row)
+        else:
+            values.append((value, row))
+    return [row for _, row in sorted(values, key=lambda item: item[0], reverse=descending)] + missing
+
+
 def open_folder(path, parent):
     try:
         os.startfile(path)
     except OSError:
         QMessageBox.warning(parent, "Folder unavailable", f"Windows could not open {path}.")
+
+
+def backup_notice(paths):
+    return "".join(f"\nKept a previous download at {path}" for path in paths)
 
 
 def pack_page_url(value):
@@ -67,13 +107,14 @@ class Window(QMainWindow):
         self.is_dark = apply_theme(QApplication.instance(), self.theme)
         self.account = int(store.setting("account") or 0)
         self.pending = {}
+        self.failed_downloads = {}
         self.rows = []
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.future = None
         self.progress_queue = SimpleQueue()
         self.poll_timer = QTimer(self, interval=100)
         self.poll_timer.timeout.connect(self.poll_job)
-        self.setWindowTitle("Quick Itch Updater")
+        self.setWindowTitle(f"Quick Itch Updater {__version__}")
         self.setMinimumSize(950, 520)
         self.resize(1130, 640)
 
@@ -102,6 +143,11 @@ class Window(QMainWindow):
         self.tracked.setChecked(store.setting("tracked_only") == "1")
         self.tracked.toggled.connect(self.set_tracked_filter)
         tools.addWidget(self.tracked)
+        self.attention = QCheckBox("Needs attention")
+        self.attention.setToolTip("Show packs with files to download or checks that failed")
+        self.attention.setChecked(store.setting("needs_attention") == "1")
+        self.attention.toggled.connect(self.set_attention_filter)
+        tools.addWidget(self.attention)
         self.refresh = QPushButton("Refresh Library", clicked=self.refresh_library)
         tools.addWidget(self.refresh)
         self.check = QPushButton("Check for Updates", clicked=self.check_updates)
@@ -122,6 +168,13 @@ class Window(QMainWindow):
         self.table.verticalHeader().setDefaultSectionSize(34)
         table_header = self.table.horizontalHeader()
         table_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        table_header.setSectionsClickable(True)
+        table_header.setSortIndicatorShown(True)
+        sort_name, _, sort_direction = (store.setting("library_sort") or "pack:asc").partition(":")
+        sort_column = LIBRARY_SORTS.index(sort_name) if sort_name in LIBRARY_SORTS else 0
+        sort_order = Qt.SortOrder.DescendingOrder if sort_direction == "desc" else Qt.SortOrder.AscendingOrder
+        table_header.setSortIndicator(sort_column, sort_order)
+        table_header.sortIndicatorChanged.connect(self.set_library_sort)
         for column, width in enumerate((130, 80, 150, 144, 144), start=1):
             self.table.setColumnWidth(column, width)
         self.table.itemChanged.connect(self.change_tracking)
@@ -135,10 +188,12 @@ class Window(QMainWindow):
         actions.addWidget(self.location, 1)
         self.page = QPushButton("Open Pack Page", clicked=self.open_pack_page)
         self.page.setToolTip("Open the selected pack in your default browser")
+        self.open_downloads = QPushButton("Open Download Folder", clicked=self.open_download_folder)
         self.files = QPushButton("Manage Files", clicked=self.manage_files)
         self.folder = QPushButton("Pack Settings", clicked=self.pack_settings)
         self.history = QPushButton("Download History", clicked=self.show_history)
         actions.addWidget(self.page)
+        actions.addWidget(self.open_downloads)
         actions.addWidget(self.files)
         actions.addWidget(self.folder)
         actions.addWidget(self.history)
@@ -150,7 +205,11 @@ class Window(QMainWindow):
         self.status = QLabel("Connect your itch.io account in Settings to import your library.",
                              objectName="status", wordWrap=True)
         self.status.setTextFormat(Qt.TextFormat.PlainText)
-        layout.addWidget(self.status)
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.status, 1)
+        self.retry = QPushButton("Retry Failed Downloads", clicked=self.retry_failed_downloads)
+        status_row.addWidget(self.retry)
+        layout.addLayout(status_row)
         self.reload()
         QApplication.styleHints().colorSchemeChanged.connect(self.system_theme_changed)
         if self.account:
@@ -158,10 +217,21 @@ class Window(QMainWindow):
 
     def reload(self):
         self.rows = self.store.library(self.account) if self.account else []
+        tracked_ids = {row.asset.id for row in self.rows if row.tracked and row.available}
+        self.failed_downloads = {key: upload for key, upload in self.failed_downloads.items() if key[0] in tracked_ids}
         self.render()
 
     def set_tracked_filter(self, enabled):
         self.store.set_setting("tracked_only", "1" if enabled else "0")
+        self.render()
+
+    def set_attention_filter(self, enabled):
+        self.store.set_setting("needs_attention", "1" if enabled else "0")
+        self.render()
+
+    def set_library_sort(self, column, order):
+        direction = "desc" if order == Qt.SortOrder.DescendingOrder else "asc"
+        self.store.set_setting("library_sort", f"{LIBRARY_SORTS[column]}:{direction}")
         self.render()
 
     def system_theme_changed(self):
@@ -184,9 +254,13 @@ class Window(QMainWindow):
         search = self.search.text().casefold().strip().rstrip("/")
         selected_id = self.selected_id()
         selected_column = max(0, self.table.currentColumn())
-        displayed = [r for r in self.rows if (not self.tracked.isChecked() or r.tracked) and any(
+        displayed = [r for r in self.rows if (not self.tracked.isChecked() or r.tracked)
+                     and (not self.attention.isChecked() or library_status(r) in ATTENTION_STATUSES) and any(
             search in value.casefold() for value in (r.asset.title, r.asset.creator, r.asset.url)
         )]
+        header = self.table.horizontalHeader()
+        displayed = sorted_library(displayed, header.sortIndicatorSection(),
+                                   header.sortIndicatorOrder() == Qt.SortOrder.DescendingOrder)
         name = self.store.setting(f"name:{self.account}") if self.account else "No account connected"
         tracked = sum(r.tracked and r.available for r in self.rows)
         self.summary.setText(f"{name or 'itch.io account'}  ·  {len(displayed)} of {len(self.rows)} projects  ·  {tracked} tracked")
@@ -196,8 +270,7 @@ class Window(QMainWindow):
         self.table.clearSelection()
         colors = STATUS_COLORS[self.is_dark]
         for index, row in enumerate(displayed):
-            status = ("Unavailable on itch.io" if not row.available else
-                      (row.status or "Not checked") if row.tracked else "Not tracked")
+            status = library_status(row)
             values = (row.asset.title, row.asset.creator, "On" if row.tracked else "Off", status,
                       date_label(row.last_checked), date_label(row.last_update))
             for column, value in enumerate(values):
@@ -227,9 +300,12 @@ class Window(QMainWindow):
         self.check.setEnabled(not busy and bool(self.account))
         self.download.setEnabled(not busy and any(self.pending.values()))
         self.page.setEnabled(not busy and row is not None and pack_page_url(row.asset.url) is not None)
+        self.open_downloads.setEnabled(not busy and row is not None)
         self.files.setEnabled(not busy and row is not None)
         self.folder.setEnabled(not busy and row is not None)
         self.history.setEnabled(not busy and row is not None)
+        self.retry.setVisible(bool(self.failed_downloads))
+        self.retry.setEnabled(not busy and bool(self.failed_downloads))
         self.location.setText(str(self.updater.folder(row)) if row else "Select a pack to see its download folder.")
 
     def open_item_page(self, item):
@@ -241,6 +317,15 @@ class Window(QMainWindow):
         url = pack_page_url(row.asset.url) if row else None
         if url is not None and not QDesktopServices.openUrl(url):
             self.status.setText(f"Windows could not open the browser. Pack page: {url.toDisplayString()}")
+
+    def open_download_folder(self):
+        row = self.selected_row()
+        if row:
+            path = self.updater.folder(row)
+            if path.is_dir():
+                open_folder(path, self)
+            else:
+                self.status.setText("This pack’s download folder does not exist yet.")
 
     def change_tracking(self, item):
         if item.column() != 2 or self.future is not None:
@@ -306,6 +391,8 @@ class Window(QMainWindow):
             self.status.setText("Settings saved.")
 
     def connected(self, result):
+        if self.account != result[0]:
+            self.failed_downloads.clear()
         self.account, count = result
         self.pending.clear()
         self.reload()
@@ -329,14 +416,18 @@ class Window(QMainWindow):
         self.run_job("Checking tracked packs…", self.updater.check, (self.account,), self.checked)
 
     def checked(self, result):
-        self.pending, errors = result
+        self.pending = result.pending
+        for key, upload in list(self.failed_downloads.items()):
+            if key[0] in self.pending and all(item.revision != upload.revision for item in self.pending[key[0]]):
+                del self.failed_downloads[key]
         self.reload()
         count = sum(len(changes) for changes in self.pending.values())
-        if errors:
-            title, message = errors[0]
-            self.status.setText(f"{len(errors)} checks failed. {title} — {message}")
+        if result.errors:
+            title, message = result.errors[0]
+            summary = f"{len(result.errors)} checks failed. {title} — {message}"
         else:
-            self.status.setText(f"Checked {len(self.pending)} tracked packs. {count} files to review.")
+            summary = f"Checked {len(self.pending)} tracked packs. {count} files to review."
+        self.status.setText(summary + backup_notice(result.retained_backups))
 
     def choose_download(self):
         dialog = QDialog(self, windowTitle="Download Updates")
@@ -400,7 +491,7 @@ class Window(QMainWindow):
                 groups.setdefault(asset, {})[upload.id] = False
             count = sum(len(group) for group in groups.values())
             for asset, visibility in groups.items():
-                self.pending[asset] = self.updater.change_upload_visibility(self.account, asset, visibility)
+                self.pending[asset] = self.change_upload_visibility(asset, visibility)
             self.reload()
             populate()
             instructions.setText(f"Hidden files: {count}. To restore them, select the pack and click Manage Files.")
@@ -410,10 +501,7 @@ class Window(QMainWindow):
         hide.clicked.connect(hide_checked)
         populate()
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            selections = selected()
-            if selections:
-                self.run_job(f"Preparing {len(selections)} files…", self.updater.download_many,
-                             (self.account, selections, self.report_progress), self.downloaded)
+            self.start_downloads(selected())
 
     def manage_files(self):
         row = self.selected_row()
@@ -446,16 +534,36 @@ class Window(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             visibility = {upload.id: files.item(index).checkState() == Qt.CheckState.Checked
                           for index, upload in enumerate(uploads)}
-            pending = self.updater.change_upload_visibility(self.account, asset, visibility)
+            pending = self.change_upload_visibility(asset, visibility)
             if row.tracked and row.available:
                 self.pending[asset] = pending
             self.reload()
             self.status.setText(f"File preferences saved for {row.asset.title}.")
 
+    def change_upload_visibility(self, asset, visibility):
+        pending = self.updater.change_upload_visibility(self.account, asset, visibility)
+        for upload, visible in visibility.items():
+            if not visible:
+                self.failed_downloads.pop((asset, upload), None)
+        return pending
+
+    def start_downloads(self, selections):
+        if selections:
+            self.run_job(f"Preparing {len(selections)} files…", self.updater.download_many,
+                         (self.account, selections, self.report_progress),
+                         lambda result: self.downloaded(result, selections))
+
+    def retry_failed_downloads(self):
+        self.start_downloads([(key[0], upload) for key, upload in self.failed_downloads.items()])
+
     def report_progress(self, number, count, filename, received, total):
         self.progress_queue.put((number, count, filename, received, total))
 
-    def downloaded(self, result):
+    def downloaded(self, result, selections):
+        for asset, upload in selections:
+            self.failed_downloads.pop((asset, upload.id), None)
+        for asset, upload in result.retryable:
+            self.failed_downloads[(asset, upload.id)] = upload
         self.pending.update(result.pending)
         self.reload()
         summary = f"Saved {result.saved} · Already saved {result.duplicates} · Could not download {len(result.errors)}"
@@ -463,6 +571,7 @@ class Window(QMainWindow):
             summary += f"\nKept {result.preserved} existing folders because they contain local changes."
         if result.cleanup_pending:
             summary += "\nA temporary backup is still on disk. The app will retry cleanup on the next update check."
+        summary += backup_notice(result.retained_backups)
         self.status.setText(summary)
         if result.errors:
             details = QMessageBox(QMessageBox.Icon.Warning, "Download results", summary, parent=self)
@@ -571,10 +680,11 @@ class Window(QMainWindow):
             self.status.setText(str(error))
         except KeyringError:
             self.status.setText("Windows Credential Manager could not access the saved key.")
-        except (sqlite3.Error, OSError, ValueError, KeyError, TypeError) as error:
+        except Exception as error:
             LOGGER.warning("Operation failed (%s)", type(error).__name__)
             self.status.setText("Could not process the request. Check the destination or retry the operation.")
-        self.update_actions()
+        finally:
+            self.update_actions()
 
     def closeEvent(self, event):
         if self.future is not None:

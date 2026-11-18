@@ -6,6 +6,7 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 
+from . import __version__
 from .model import Asset, Upload
 
 
@@ -14,6 +15,10 @@ REDIRECTS = {301, 302, 303, 307, 308}
 
 
 class ItchError(Exception):
+    pass
+
+
+class ItchKeyDenied(ItchError):
     pass
 
 
@@ -35,7 +40,7 @@ class ItchClient:
         self.key = key
         self.session = httpx.Client(
             transport=transport, timeout=httpx.Timeout(30, connect=10),
-            headers={"User-Agent": "Quick-Itch-Updater/0.1", "Accept-Encoding": "identity"},
+            headers={"User-Agent": f"Quick-Itch-Updater/{__version__}", "Accept-Encoding": "identity"},
         )
 
     def __enter__(self):
@@ -63,6 +68,9 @@ class ItchClient:
             break
         if allow_redirect and response.status_code in REDIRECTS and response.headers.get("Location"):
             return {"url": urljoin(str(response.url), response.headers["Location"])}
+        using_download_key = params is not None and "download_key_id" in params
+        if using_download_key and response.status_code == 403:
+            raise ItchKeyDenied("itch.io denied access with this download key.")
         if response.status_code in {401, 403}:
             raise ItchError("itch.io denied access. Check your API key and ownership of this file.")
         if response.is_error or response.is_redirect:
@@ -71,7 +79,11 @@ class ItchClient:
             result = response.json()
         except ValueError:
             raise ItchError("itch.io returned an unreadable response.") from None
-        if not isinstance(result, dict) or result.get("errors"):
+        if not isinstance(result, dict):
+            raise ItchError("itch.io returned an unexpected response.")
+        if result.get("errors"):
+            if using_download_key:
+                raise ItchKeyDenied("itch.io rejected this download key or its access to the file.")
             raise ItchError("itch.io rejected the request. Check your account and access to this pack.")
         return result
 
@@ -111,8 +123,15 @@ class ItchClient:
 
     def uploads(self, asset):
         uploads = {}
+        last_denial = None
+        accessed = False
         for key_id in asset.key_ids:
-            payload = self._get(f"/games/{asset.id}/uploads", {"download_key_id": key_id})
+            try:
+                payload = self._get(f"/games/{asset.id}/uploads", {"download_key_id": key_id})
+            except ItchKeyDenied as error:
+                last_denial = error
+                continue
+            accessed = True
             items = payload.get("uploads")
             if items is None or items == {}:
                 continue
@@ -129,6 +148,8 @@ class ItchClient:
                     item.get("updated_at"), build.get("created_at") or item.get("created_at"),
                     item.get("display_name"),
                 ))
+        if not accessed and last_denial is not None:
+            raise last_denial
         return list(uploads.values())
 
     @contextmanager

@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field, replace
 import hashlib
 from itertools import count
+import lzma
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -9,6 +10,7 @@ import stat
 from tempfile import TemporaryDirectory
 from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
+import zlib
 
 
 class FileSafetyError(Exception):
@@ -25,9 +27,13 @@ WINDOWS_RESERVED = re.compile(r"(?:CON|CONIN\$|CONOUT\$|PRN|AUX|NUL|COM[0-9¹²�
 WINDOWS_INVALID = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
-def file_component(value):
+def file_component(value, *, keep_suffix=False):
     name = WINDOWS_INVALID.sub("_", value).strip().rstrip(". ")
-    name = name[:100].rstrip(". ") or "Untitled"
+    suffix = PurePosixPath(name).suffix if keep_suffix else ""
+    if len(name) > 100 and 0 < len(suffix) < 100:
+        name = name[:100 - len(suffix)].rstrip(". ") + suffix
+    else:
+        name = name[:100].rstrip(". ") or "Untitled"
     return f"_{name}" if WINDOWS_RESERVED.match(name) else name
 
 
@@ -68,6 +74,7 @@ class SavedDownload:
     replaced: bool = False
     preserved: bool = False
     cleanup_pending: bool = False
+    retained_backup: Path | None = None
 
 
 def matches_download(root, version):
@@ -109,24 +116,36 @@ def matches_download(root, version):
         return False
 
 
-def remove_backup(root, backup):
+def validate_backup(root, backup):
     validate_destination(backup)
     parent = root.parent.resolve(strict=True)
     if backup.resolve(strict=True).parent != parent or not backup.name.startswith(".quick-itch-backup-"):
         raise FileSafetyError("Could not verify the temporary backup folder.")
-    shutil.rmtree(backup)
 
 
-def recover_replacement(root, backup, committed):
+def finish_backup(root, backup, previous):
+    if not os.path.lexists(backup):
+        return None
+    validate_backup(root, backup)
+    if previous is not None and matches_download(backup, previous):
+        shutil.rmtree(backup)
+        return None
+    label = file_component(root.name)
+    for number in count(1):
+        suffix = "previous copy" if number == 1 else f"previous copy {number}"
+        preserved = root.with_name(f"{label} ({suffix})")
+        if os.path.lexists(preserved):
+            continue
+        try:
+            return backup.rename(preserved)
+        except FileExistsError:
+            continue
+
+
+def recover_replacement(root, backup):
     if not os.path.lexists(backup):
         return
-    if committed:
-        remove_backup(root, backup)
-        return
-    validate_destination(backup)
-    validate_destination(root.parent)
-    if backup.resolve(strict=True).parent != root.parent.resolve(strict=True) or not backup.name.startswith(".quick-itch-backup-"):
-        raise FileSafetyError("Could not verify the temporary backup folder.")
+    validate_backup(root, backup)
     if os.path.lexists(root):
         validate_destination(root)
         root.rename(root.with_name(f".quick-itch-recovered-{uuid4().hex}"))
@@ -194,14 +213,14 @@ def extract_zip(archive_path, destination):
                                                          for member, relative in entries}, hashes)
     except NotImplementedError as error:
         raise ArchiveNeedsOriginal("This ZIP uses unsupported compression.") from error
-    except (BadZipFile, RuntimeError) as error:
+    except (BadZipFile, RuntimeError, zlib.error, lzma.LZMAError, EOFError) as error:
         raise FileSafetyError("The ZIP is damaged and could not be extracted.") from error
 
 
-def replace_current(staging, root, download, record):
+def replace_current(staging, root, download, previous, record):
     backup = root.with_name(f".quick-itch-backup-{uuid4().hex}")
     if record:
-        record.begin(root, backup)
+        record.begin(root, backup, previous)
     published = False
     try:
         root.rename(backup)
@@ -218,18 +237,18 @@ def replace_current(staging, root, download, record):
             record.finish()
         raise
     try:
-        remove_backup(root, backup)
+        retained = finish_backup(root, backup, previous)
     except (FileSafetyError, OSError):
         return replace(download, cleanup_pending=True)
     if record:
         record.finish()
-    return download
+    return replace(download, retained_backup=retained) if retained else download
 
 
 def download_version(client, upload, destination, earlier, progress, mode=EXTRACT_ZIPS, *, record=None):
     destination = validate_destination(destination)
     destination.mkdir(parents=True, exist_ok=True)
-    filename = file_component(upload.filename)
+    filename = file_component(upload.filename, keep_suffix=True)
     with TemporaryDirectory(prefix=".quick-itch-", dir=destination) as temporary:
         working = Path(temporary)
         transfer = working / "transfer"
@@ -286,7 +305,7 @@ def download_version(client, upload, destination, earlier, progress, mode=EXTRAC
             elif matches_download(previous, current):
                 path = previous if manifest is not None else previous / filename
                 download = SavedDownload(path, checksum, manifest, current=True, replaced=True)
-                return replace_current(staging, previous, download, record)
+                return replace_current(staging, previous, download, current, record)
             else:
                 preserved = True
         for number in count(1):

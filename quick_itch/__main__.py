@@ -4,17 +4,21 @@ from pathlib import Path
 import sys
 
 from PySide6.QtCore import QLockFile
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from .appearance import CheckStyle
-from .store import Store
-from .updater import Updater
-from .window import Window
+import quick_itch
+from quick_itch.appearance import CheckStyle
+from quick_itch.store import Store
+from quick_itch.updater import Updater
+from quick_itch.window import Window
 
 
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Quick Itch Updater")
+    app.setApplicationVersion(quick_itch.__version__)
+    app.setWindowIcon(QIcon(str(Path(quick_itch.__file__).with_name("quick-itch-updater.ico"))))
     app.setStyle(CheckStyle("Fusion"))
     data = Path(os.environ["LOCALAPPDATA"]) / "Quick Itch Updater"
     data.mkdir(parents=True, exist_ok=True)

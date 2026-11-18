@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import sqlite3
 
-from .files import ExtractedManifest, FileSafetyError, matches_download, recover_replacement
+from .files import ExtractedManifest, FileSafetyError, file_component, finish_backup, matches_download, recover_replacement
 from .model import Asset, Upload
 
 
@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS assets (
     account INTEGER NOT NULL, id INTEGER NOT NULL, title TEXT NOT NULL, creator TEXT NOT NULL,
     url TEXT NOT NULL, key_ids TEXT NOT NULL, classification TEXT,
     tracked INTEGER NOT NULL DEFAULT 0, destination TEXT, status TEXT, last_checked TEXT,
-    last_update TEXT, available INTEGER NOT NULL DEFAULT 1, storage_mode TEXT,
+    last_update TEXT, available INTEGER NOT NULL DEFAULT 1, storage_mode TEXT, default_folder TEXT,
     PRIMARY KEY (account, id)
 );
 CREATE TABLE IF NOT EXISTS versions (
@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS versions (
 );
 CREATE TABLE IF NOT EXISTS pending_replacements (
     account INTEGER NOT NULL, asset INTEGER NOT NULL, upload INTEGER NOT NULL,
-    root TEXT NOT NULL, backup TEXT NOT NULL, committed INTEGER NOT NULL DEFAULT 0,
+    root TEXT NOT NULL, backup TEXT NOT NULL, committed INTEGER NOT NULL DEFAULT 0, previous TEXT,
     PRIMARY KEY (account, asset, upload)
 );
 CREATE TABLE IF NOT EXISTS upload_catalog (
@@ -50,6 +50,7 @@ class LibraryRow:
     last_update: str | None
     available: bool
     storage_mode: str | None
+    default_folder: Path
 
 
 @dataclass(frozen=True)
@@ -65,16 +66,37 @@ class Version:
 
 
 @dataclass(frozen=True)
+class BackupFingerprint:
+    path: Path
+    digest: str
+    manifest: ExtractedManifest | None
+
+    @classmethod
+    def from_json(cls, value):
+        data = json.loads(value)
+        manifest = ExtractedManifest(**data["manifest"]) if data["manifest"] is not None else None
+        return cls(Path(data["path"]), data["digest"], manifest)
+
+
+def default_pack_folder(creator, title, asset):
+    return Path(file_component(creator)) / f"{file_component(title)} [{asset}]"
+
+
+@dataclass(frozen=True)
 class DownloadRecord:
     store: "Store"
     account: int
     asset: int
     upload: Upload
 
-    def begin(self, root, backup):
+    def begin(self, root, backup, previous):
+        fingerprint = BackupFingerprint(previous.path, previous.digest, previous.manifest)
         with self.store.connect() as connection:
-            connection.execute("INSERT INTO pending_replacements (account, asset, upload, root, backup) VALUES (?, ?, ?, ?, ?)",
-                               (self.account, self.asset, self.upload.id, str(root), str(backup)))
+            connection.execute("""
+                INSERT INTO pending_replacements (account, asset, upload, root, backup, previous)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (self.account, self.asset, self.upload.id, str(root), str(backup),
+                  json.dumps(asdict(fingerprint), default=str)))
 
     def save(self, download):
         self.store.save_version(self.account, self.asset, self.upload, download)
@@ -92,11 +114,36 @@ class Store:
         self.database = database
         with self.connect() as connection:
             connection.executescript(SCHEMA)
-            for table, column, definition in (("assets", "storage_mode", "TEXT"), ("versions", "manifest", "TEXT"),
-                                              ("versions", "current", "INTEGER NOT NULL DEFAULT 0")):
+            for table, column, definition in (("assets", "storage_mode", "TEXT"), ("assets", "default_folder", "TEXT"),
+                                              ("versions", "manifest", "TEXT"),
+                                              ("versions", "current", "INTEGER NOT NULL DEFAULT 0"),
+                                              ("pending_replacements", "previous", "TEXT")):
                 columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
                 if column not in columns:
                     connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            self._assign_existing_folders(connection)
+
+    def _assign_existing_folders(self, connection):
+        rows = connection.execute("SELECT account, id, title, creator FROM assets WHERE default_folder IS NULL").fetchall()
+        if not rows:
+            return
+        setting = connection.execute("SELECT value FROM settings WHERE name = 'download_root'").fetchone()
+        base = Path(setting[0]) if setting else Path.home() / "GameAssets"
+        for row in rows:
+            folder = default_pack_folder(row["creator"], row["title"], row["id"])
+            versions = connection.execute("""
+                SELECT path FROM versions WHERE account = ? AND asset = ? ORDER BY current DESC, saved_at DESC, rowid DESC
+            """, (row["account"], row["id"]))
+            for version in versions:
+                path = Path(version["path"])
+                if not path.is_relative_to(base):
+                    continue
+                parts = path.relative_to(base).parts
+                if len(parts) >= 3 and ".." not in parts and parts[1].endswith(f" [{row['id']}]"):
+                    folder = Path(*parts[:2])
+                    break
+            connection.execute("UPDATE assets SET default_folder = ? WHERE account = ? AND id = ?",
+                               (str(folder), row["account"], row["id"]))
 
     @contextmanager
     def connect(self):
@@ -121,12 +168,13 @@ class Store:
         with self.connect() as connection:
             connection.execute("UPDATE assets SET available = 0 WHERE account = ?", (account,))
             connection.executemany("""
-                INSERT INTO assets (account, id, title, creator, url, key_ids, classification)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO assets (account, id, title, creator, url, key_ids, classification, default_folder)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account, id) DO UPDATE SET title = excluded.title,
                     creator = excluded.creator, url = excluded.url, key_ids = excluded.key_ids,
                     classification = excluded.classification, available = 1
-            """, [(account, a.id, a.title, a.creator, a.url, json.dumps(a.key_ids), a.classification)
+            """, [(account, a.id, a.title, a.creator, a.url, json.dumps(a.key_ids), a.classification,
+                  str(default_pack_folder(a.creator, a.title, a.id)))
                   for a in assets])
 
     def library(self, account, tracked_only=False):
@@ -139,7 +187,7 @@ class Store:
         return [LibraryRow(
             Asset(r["id"], r["title"], r["creator"], r["url"], tuple(json.loads(r["key_ids"])), r["classification"]),
             bool(r["tracked"]), r["destination"], r["status"], r["last_checked"], r["last_update"],
-            bool(r["available"]), r["storage_mode"],
+            bool(r["available"]), r["storage_mode"], Path(r["default_folder"]),
         ) for r in rows]
 
     def track(self, account, asset, enabled):
@@ -198,15 +246,26 @@ class Store:
         with self.connect() as connection:
             rows = connection.execute("SELECT * FROM pending_replacements WHERE account = ? AND asset = ?",
                                       (account, asset)).fetchall()
+        retained = []
         for row in rows:
             root, backup = Path(row["root"]), Path(row["backup"])
-            if row["committed"] and backup.exists():
+            if row["committed"]:
                 version = next((item for item in self.versions(account, asset)
                                 if item.current and item.upload == row["upload"]), None)
-                if version is None or not matches_download(root, version):
-                    raise FileSafetyError("A previous download backup was kept because the current folder changed.")
-            recover_replacement(root, backup, bool(row["committed"]))
+                previous = None
+                if row["previous"] and version is not None and matches_download(root, version):
+                    previous = BackupFingerprint.from_json(row["previous"])
+                try:
+                    preserved = finish_backup(root, backup, previous)
+                except (OSError, FileSafetyError):
+                    retained.append(backup)
+                else:
+                    if preserved is not None:
+                        retained.append(preserved)
+            else:
+                recover_replacement(root, backup)
             self.clear_replacement(account, asset, row["upload"])
+        return retained
 
     def clear_replacement(self, account, asset, upload):
         with self.connect() as connection:
