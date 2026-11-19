@@ -4,6 +4,8 @@ A Windows desktop app that checks the itch.io asset packs you choose and keeps t
 
 **[Download for Windows x64](https://github.com/myric227/Quick-Itch-Updater/releases/latest)** · Standalone executable with Python bundled.
 
+![Quick Itch Updater in dark mode, showing the pack library and tracking status](docs/library.png)
+
 ## Quick start
 
 1. Open the app and enter your personal itch.io API key in **Settings**. Windows Credential Manager stores the key.
