@@ -261,9 +261,10 @@ class Window(QMainWindow):
         header = self.table.horizontalHeader()
         displayed = sorted_library(displayed, header.sortIndicatorSection(),
                                    header.sortIndicatorOrder() == Qt.SortOrder.DescendingOrder)
-        name = self.store.setting(f"name:{self.account}") if self.account else "No account connected"
         tracked = sum(r.tracked and r.available for r in self.rows)
-        self.summary.setText(f"{name or 'itch.io account'}  ·  {len(displayed)} of {len(self.rows)} projects  ·  {tracked} tracked")
+        summary = (f"{len(displayed)} of {len(self.rows)} projects  ·  {tracked} tracked"
+                   if self.account else "No itch.io account connected")
+        self.summary.setText(summary)
         self.table.blockSignals(True)
         self.table.clearContents()
         self.table.setRowCount(len(displayed))
@@ -341,6 +342,10 @@ class Window(QMainWindow):
         dialog = QDialog(self, windowTitle="Settings")
         dialog.setMinimumWidth(500)
         layout = QFormLayout(dialog)
+        account_name = self.store.setting(f"name:{self.account}") if self.account else None
+        account = QLabel(account_name or ("Connected" if self.account else "Not connected"))
+        account.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addRow("itch.io account", account)
         theme = QComboBox()
         for label, value in THEMES:
             theme.addItem(label, value)
