@@ -174,23 +174,28 @@ def extract_zip(archive_path, destination):
     try:
         with ZipFile(archive_path) as archive:
             entries = []
-            paths = set()
+            paths = {}
+            explicit_paths = set()
             for member in archive.infolist():
-                name = member.orig_filename
-                raw_parts = name.rstrip("/").split("/")
+                raw_parts = member.orig_filename.rstrip("/").split("/")
+                parts = tuple(part.rstrip(" .") for part in raw_parts)
                 mode = stat.S_IFMT(member.external_attr >> 16)
                 if any(
-                    not part or part in {".", ".."} or part.endswith((" ", "."))
-                    or WINDOWS_RESERVED.match(part) or WINDOWS_INVALID.search(part)
-                    for part in raw_parts
+                    not part or WINDOWS_RESERVED.match(part) or WINDOWS_INVALID.search(part)
+                    for part in parts
                 ) or mode not in {0, stat.S_IFREG, stat.S_IFDIR}:
                     raise FileSafetyError("The ZIP contains an unsafe path or a special file.")
-                relative = PurePosixPath(*raw_parts)
-                folded = str(relative).casefold()
-                if folded in paths:
+                folded = tuple(part.casefold() for part in parts)
+                if folded in explicit_paths:
                     raise FileSafetyError("The ZIP contains duplicate paths on Windows.")
-                paths.add(folded)
-                entries.append((member, relative))
+                explicit_paths.add(folded)
+                original = tuple(part.casefold() for part in raw_parts)
+                for depth in range(1, len(parts) + 1):
+                    # Check implicit directories too so normalization cannot merge two folders.
+                    source = (original[:depth], depth < len(parts) or member.is_dir())
+                    if paths.setdefault(folded[:depth], source) != source:
+                        raise FileSafetyError("The ZIP contains conflicting paths on Windows.")
+                entries.append((member, PurePosixPath(*parts)))
             if any(member.flag_bits & 1 for member, _ in entries):
                 raise ArchiveNeedsOriginal("This ZIP is password-protected.")
             if sum(member.file_size for member, _ in entries) > shutil.disk_usage(destination.parent).free:

@@ -477,7 +477,8 @@ class DownloadTests(unittest.TestCase):
     def test_rejects_archive_traversal_and_windows_paths(self):
         with TemporaryDirectory() as temp:
             root = Path(temp)
-            for bad_name in ("../escape.txt", "/root.txt", "C:/drive.txt", "pack\\escape.txt", "NUL.txt", "file:ads"):
+            for bad_name in ("../escape.txt", ".. /escape.txt", "/root.txt", "C:/drive.txt",
+                             "pack\\escape.txt", "NUL.txt", "NUL./asset.txt", "file:ads"):
                 with self.subTest(bad_name=bad_name):
                     normalized = bad_name.replace("\\", "/")
                     data = archive_bytes(normalized).replace(normalized.encode(), bad_name.encode())
@@ -491,6 +492,28 @@ class DownloadTests(unittest.TestCase):
             with self.assertRaises(FileSafetyError):
                 extract_zip(root / "test.zip", root / "extracted")
             self.assertFalse((root / "extracted").exists())
+
+    def test_extracts_zip_with_trailing_spaces_and_periods(self):
+        package = archive_bytes("effects /sprites./burst.png ")
+        with TemporaryDirectory() as temp:
+            saved = download_version(Transfer(package), hosted_upload(package), Path(temp), [], lambda *_: None)
+            name = "effects/sprites/burst.png"
+            self.assertEqual((saved.path / name).read_bytes(), b"asset")
+            self.assertEqual(saved.manifest.entries, {name: len(b"asset")})
+            self.assertIn(name, saved.manifest.hashes)
+
+    def test_rejects_collisions_after_normalizing_zip_paths(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            package = root / "test.zip"
+            for names in (("sprite.png", "sprite.png "), ("effects /a.png", "effects/b.png")):
+                with self.subTest(names=names):
+                    with ZipFile(package, "w") as archive:
+                        for name in names:
+                            archive.writestr(name, b"asset")
+                    with self.assertRaisesRegex(FileSafetyError, "paths on Windows"):
+                        extract_zip(package, root / "extracted")
+                    self.assertFalse((root / "extracted").exists())
 
     def test_rejects_unity_project_destinations(self):
         with TemporaryDirectory() as temp:
